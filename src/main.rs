@@ -1,3 +1,12 @@
+// Copyright (c) 2023 The vulkano developers
+// Licensed under the Apache License, Version 2.0
+// <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT
+// license <LICENSE-MIT or https://opensource.org/licenses/MIT>,
+// at your option. All files in the project carrying such
+// notice may not be copied, modified, or distributed except
+// according to those terms.
+
 // This example showcases how you can most effectively update a resource asynchronously, such that
 // your rendering or any other tasks can use the resource without any latency at the same time as
 // it's being updated.
@@ -27,10 +36,9 @@
 // same data but their consistency is not strict. A replica might be out-of-date for some time
 // before *reaching convergence*, hence becoming consistent, eventually.
 
-use glam::f32::Mat4;
+use cgmath::{Matrix4, Rad};
 use rand::Rng;
 use std::{
-    error::Error,
     hint,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -42,12 +50,12 @@ use std::{
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, BufferImageCopy, ClearColorImageInfo,
-        CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferToImageInfo,
-        RecordingCommandBuffer, RenderPassBeginInfo,
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, BufferImageCopy,
+        ClearColorImageInfo, CommandBufferUsage, CopyBufferToImageInfo,
+        PrimaryCommandBufferAbstract, RenderPassBeginInfo,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+        allocator::StandardDescriptorSetAllocator, PersistentDescriptorSet, WriteDescriptorSet,
     },
     device::{
         physical::PhysicalDeviceType, Device, DeviceCreateInfo, DeviceExtensions, Queue,
@@ -83,19 +91,18 @@ use vulkano::{
     Validated, VulkanError, VulkanLibrary,
 };
 use winit::{
-    event::{ElementState, Event, KeyEvent, WindowEvent},
+    event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
     window::WindowBuilder,
 };
 
 const TRANSFER_GRANULARITY: u32 = 4096;
 
-fn main() -> Result<(), impl Error> {
-    let event_loop = EventLoop::new().unwrap();
+fn main() {
+    let event_loop = EventLoop::new();
 
     let library = VulkanLibrary::new().unwrap();
-    let required_extensions = Surface::required_extensions(&event_loop).unwrap();
+    let required_extensions = Surface::required_extensions(&event_loop);
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
@@ -332,14 +339,10 @@ fn main() -> Result<(), impl Error> {
 
     // Initialize the textures.
     {
-        let mut builder = RecordingCommandBuffer::new(
-            command_buffer_allocator.clone(),
+        let mut builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.as_ref(),
             graphics_queue.queue_family_index(),
-            CommandBufferLevel::Primary,
-            CommandBufferBeginInfo {
-                usage: CommandBufferUsage::OneTimeSubmit,
-                ..Default::default()
-            },
+            CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
         for texture in &textures {
@@ -347,7 +350,7 @@ fn main() -> Result<(), impl Error> {
                 .clear_color_image(ClearColorImageInfo::image(texture.clone()))
                 .unwrap();
         }
-        let command_buffer = builder.end().unwrap();
+        let command_buffer = builder.build().unwrap();
 
         // This waits for the queue to become idle, which is fine for startup initializations.
         let _ = command_buffer.execute(graphics_queue.clone()).unwrap();
@@ -432,7 +435,9 @@ fn main() -> Result<(), impl Error> {
             .unwrap()
             .entry_point("main")
             .unwrap();
-        let vertex_input_state = MyVertex::per_vertex().definition(&vs).unwrap();
+        let vertex_input_state = MyVertex::per_vertex()
+            .definition(&vs.info().input_interface)
+            .unwrap();
         let stages = [
             PipelineShaderStageCreateInfo::new(vs),
             PipelineShaderStageCreateInfo::new(fs),
@@ -478,18 +483,16 @@ fn main() -> Result<(), impl Error> {
     };
     let mut framebuffers = window_size_dependent_setup(&images, render_pass.clone(), &mut viewport);
 
-    let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
-        device.clone(),
-        Default::default(),
-    ));
+    let descriptor_set_allocator =
+        StandardDescriptorSetAllocator::new(device.clone(), Default::default());
 
     // A byproduct of always using the same set of uniform buffers is that we can also create one
     // descriptor set for each, reusing them in the same way as the buffers.
     let uniform_buffer_sets = uniform_buffers
         .iter()
         .map(|buffer| {
-            DescriptorSet::new(
-                descriptor_set_allocator.clone(),
+            PersistentDescriptorSet::new(
+                &descriptor_set_allocator,
                 pipeline.layout().set_layouts()[0].clone(),
                 [WriteDescriptorSet::buffer(0, buffer.clone())],
                 [],
@@ -501,8 +504,8 @@ fn main() -> Result<(), impl Error> {
     // Create the descriptor sets for sampling the textures.
     let sampler = Sampler::new(device.clone(), SamplerCreateInfo::simple_repeat_linear()).unwrap();
     let sampler_sets = textures.map(|texture| {
-        DescriptorSet::new(
-            descriptor_set_allocator.clone(),
+        PersistentDescriptorSet::new(
+            &descriptor_set_allocator,
             pipeline.layout().set_layouts()[1].clone(),
             [
                 WriteDescriptorSet::sampler(0, sampler.clone()),
@@ -518,15 +521,13 @@ fn main() -> Result<(), impl Error> {
 
     println!("\nPress space to update part of the texture");
 
-    event_loop.run(move |event, elwt| {
-        elwt.set_control_flow(ControlFlow::Poll);
-
+    event_loop.run(move |event, _, control_flow| {
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                elwt.exit();
+                *control_flow = ControlFlow::Exit;
             }
             Event::WindowEvent {
                 event: WindowEvent::Resized(_),
@@ -537,10 +538,10 @@ fn main() -> Result<(), impl Error> {
             Event::WindowEvent {
                 event:
                     WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                logical_key: Key::Named(NamedKey::Space),
+                        input:
+                            KeyboardInput {
                                 state: ElementState::Released,
+                                virtual_keycode: Some(VirtualKeyCode::Space),
                                 ..
                             },
                         ..
@@ -549,10 +550,7 @@ fn main() -> Result<(), impl Error> {
             } => {
                 channel.send(()).unwrap();
             }
-            Event::WindowEvent {
-                event: WindowEvent::RedrawRequested,
-                ..
-            } => {
+            Event::RedrawEventsCleared => {
                 let image_extent: [u32; 2] = window.inner_size().into();
 
                 if image_extent.contains(&0) {
@@ -590,17 +588,12 @@ fn main() -> Result<(), impl Error> {
                     recreate_swapchain = true;
                 }
 
-                let mut builder = RecordingCommandBuffer::new(
-                    command_buffer_allocator.clone(),
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    command_buffer_allocator.as_ref(),
                     graphics_queue.queue_family_index(),
-                    CommandBufferLevel::Primary,
-                    CommandBufferBeginInfo {
-                        usage: CommandBufferUsage::OneTimeSubmit,
-                        ..Default::default()
-                    },
+                    CommandBufferUsage::OneTimeSubmit,
                 )
                 .unwrap();
-
                 builder
                     .begin_render_pass(
                         RenderPassBeginInfo {
@@ -630,15 +623,13 @@ fn main() -> Result<(), impl Error> {
                     )
                     .unwrap()
                     .bind_vertex_buffers(0, vertex_buffer.clone())
+                    .unwrap()
+                    .draw(vertex_buffer.len() as u32, 1, 0, 0)
+                    .unwrap()
+                    .end_render_pass(Default::default())
                     .unwrap();
+                let command_buffer = builder.build().unwrap();
 
-                unsafe {
-                    builder.draw(vertex_buffer.len() as u32, 1, 0, 0).unwrap();
-                }
-
-                builder.end_render_pass(Default::default()).unwrap();
-
-                let command_buffer = builder.end().unwrap();
                 acquire_future.wait(None).unwrap();
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
 
@@ -657,7 +648,7 @@ fn main() -> Result<(), impl Error> {
                         let delta = (remainder / DURATION) as f32;
                         let angle = delta * std::f32::consts::PI * 2.0;
 
-                        Mat4::from_rotation_z(angle).to_cols_array_2d()
+                        Matrix4::from_angle_z(Rad(angle)).into()
                     },
                 };
 
@@ -694,10 +685,9 @@ fn main() -> Result<(), impl Error> {
                     }
                 }
             }
-            Event::AboutToWait => window.request_redraw(),
             _ => (),
         }
-    })
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,14 +761,10 @@ fn run_worker(
             // Write to the texture that's currently not in use for rendering.
             let texture = textures[!current_index as usize].clone();
 
-            let mut builder = RecordingCommandBuffer::new(
-                command_buffer_allocator.clone(),
+            let mut builder = AutoCommandBufferBuilder::primary(
+                command_buffer_allocator.as_ref(),
                 transfer_queue.queue_family_index(),
-                CommandBufferLevel::Primary,
-                CommandBufferBeginInfo {
-                    usage: CommandBufferUsage::OneTimeSubmit,
-                    ..Default::default()
-                },
+                CommandBufferUsage::OneTimeSubmit,
             )
             .unwrap();
             builder
@@ -810,7 +796,7 @@ fn run_worker(
                     )
                 })
                 .unwrap();
-            let command_buffer = builder.end().unwrap();
+            let command_buffer = builder.build().unwrap();
 
             // We swap the texture index to use after a write, but there is no guarantee that other
             // tasks have actually moved on to using the new texture. What could happen then, if
